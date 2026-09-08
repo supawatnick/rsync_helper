@@ -30,7 +30,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: rsync
-          image: 10.10.110.8/library/rsync-helper:1.0.0
+          image: <REGISTRY_HOST>/<PROJECT>/rsync-helper:1.0.0
           env:
             - name: TZ
               value: Asia/Bangkok

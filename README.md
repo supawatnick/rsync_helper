@@ -39,19 +39,111 @@ ENV TZ=Asia/Bangkok
 | `coreutils` | `md5sum` for integrity check |
 | `tzdata` | correct timezone (`TZ=Asia/Bangkok`) |
 
-You can build and push it to your registry:
+You can build and push it to your own registry. Below is the full end-to-end
+guide (build + upload + what to change in the YAML manifests).
+
+---
+
+## Build & upload the image to your registry / สร้างและอัปโหลด image ขึ้น registry
+
+### Step 0 — Prerequisites / สิ่งที่ต้องเตรียม
+
+- A container registry (e.g. **Harbor**, Docker Hub, private registry) reachable
+  from all cluster nodes.
+- A machine with **docker** CLI that can reach that registry.
+
+Define two variables for the rest of this guide:
 
 ```bash
-# rebuild & re-tag
-docker build -t <registry>/library/rsync-helper:1.0.0 .
-docker tag <registry>/library/rsync-helper:1.0.0 <registry>/library/rsync-helper:latest
-docker push <registry>/library/rsync-helper:1.0.0
-docker push <registry>/library/rsync-helper:latest
+export REGISTRY=<REGISTRY_HOST>        # e.g. harbor.example.com:443 (NO scheme, NO trailing slash)
+export PROJECT=<PROJECT>               # registry project/namespace, e.g. library (public) or rsync
 ```
 
-> Verified with a **public** Harbor registry at `http://10.10.110.8` inside this
-> lab. With Harbor's `library` project (public), pods can pull without any
-> imagePullSecrets. For a private project, add `imagePullSecrets` to the pod.
+### Step 1 — Login to the registry / เข้าสู่ระบบ
+
+```bash
+docker login $REGISTRY
+# (Harbor: admin / <password>  หรือ robot account)
+```
+
+> If your registry is HTTP only (no TLS), configure the docker daemon first:
+> `/etc/docker/daemon.json` → `{"insecure-registries": ["$REGISTRY"]}` then
+> `systemctl restart docker`. Same for containerd on the k8s nodes (see below).
+
+### Step 2 — Build the golden image / สร้าง golden image
+
+From the repo root:
+
+```bash
+docker build -t $REGISTRY/$PROJECT/rsync-helper:1.0.0 .
+```
+
+### Step 3 — Tag an alias (optional) / ตั้ง tag สำรอง
+
+```bash
+docker tag $REGISTRY/$PROJECT/rsync-helper:1.0.0 $REGISTRY/$PROJECT/rsync-helper:latest
+```
+
+### Step 4 — Push / อัปโหลด
+
+```bash
+docker push $REGISTRY/$PROJECT/rsync-helper:1.0.0
+docker push $REGISTRY/$PROJECT/rsync-helper:latest      # only if you tagged in step 3
+```
+
+Verify:
+
+```bash
+docker run --rm $REGISTRY/$PROJECT/rsync-helper:1.0.0 sh -c "which rsync && rsync --version | head -1"
+# expect: /usr/bin/rsync  /  rsync  version 3.x
+```
+
+### Step 5 — Make the cluster nodes trust the registry / ให้ node ใน cluster ดึง image ได้
+
+| Registry type | Node-side configuration |
+|---------------|------------------------|
+| HTTPS + valid cert | nothing (default) |
+| HTTP (no TLS) — e.g. Harbor with `http://` | configure containerd `hosts.toml` (preferred) OR `insecure-registries` (deprecated) |
+| Private project | add an `imagePullSecrets` to every pod (see below) |
+
+For containerd with `config_path = "/etc/containerd/certs.d"` (HTTP registry):
+
+```toml
+# /etc/containerd/certs.d/<REGISTRY_HOST>/hosts.toml  (on EVERY node)
+server = "http://<REGISTRY_HOST>"
+
+[host."http://<REGISTRY_HOST>"]
+  capabilities = ["pull", "resolve", "push"]
+```
+
+Then restart containerd and re-pull:
+
+```bash
+systemctl restart containerd && systemctl is-active containerd
+```
+
+**Private project + imagePullSecrets** — if `$PROJECT` is private:
+
+```bash
+kubectl -n <NAMESPACE> create secret docker-registry regcred \
+  --docker-server=$REGISTRY \
+  --docker-username=<USER> \
+  --docker-password=<PASS> \
+  --namespace=<NAMESPACE>
+```
+
+and add to each pod in the manifests:
+
+```yaml
+spec:
+  imagePullSecrets:
+    - name: regcred
+```
+
+> **Golden image concept / หลักการของ golden image:** packages (`rsync`,
+> `coreutils`, `tzdata`) are baked in **at build time** — pods start instantly
+> and need **no internet** to install anything (unlike the original scripts that
+> ran `apk add` on every startup).
 
 ---
 
@@ -93,6 +185,66 @@ This deploys the same loop as a `StatefulSet` with `podManagementPolicy: Paralle
 Read **`docs/sts-gotchas.md`** before using it — there are 7 important pitfalls
 (PVC immutable naming, `restartPolicy: Always`, RWO co-location, required headless
 Service, scale-down vs PVC deletion, updateStrategy, adoption rules).
+
+---
+
+## YAML — what you must change before deploying / ต้องแก้ส่วนไหนบ้างก่อนใช้
+
+The manifests use `<PLACEHOLDER>` values on purpose so you can adapt them to your
+environment. Below is the **line-by-line checklist** for each file.
+
+### Common — all files / ไฟล์ที่ทุกโหมดใช้เหมือนกัน
+
+| File | Field | What to change / ต้องแก้เป็น |
+|------|-------|------------------------------|
+| `manifests/mode-single-pod/00-namespace.yaml` | `metadata.name` | namespace ของคุณ (default `demo`) |
+| `manifests/mode-statefulset/00-namespace.yaml` | `metadata.name` | namespace ของคุณ |
+| both `04-rsync-helper*.yaml` | `metadata.namespace` | ชื่อ namespace ตรงกับข้างบน |
+| all PVC files | `metadata.namespace` | ชื่อ namespace เดียวกัน |
+| all PVC files | `spec.storageClassName` | ชื่อ StorageClass ของ storage ปลายทาง/ต้นทางตามจริง |
+| both `04-rsync-helper*.yaml` | `image:` | `<REGISTRY_HOST>/<PROJECT>/rsync-helper:1.0.0` → registry/project ที่ push ไปใน Step 4 |
+| (private project) | `imagePullSecrets` | เพิ่ม `regcred` secret ตาม Step 5 |
+
+### MODE 1 — `04-rsync-helper.yaml` (mapping data ของคุณ)
+
+| Field | Where (approx. line) | What to change / ต้องแก้เป็น |
+|-------|----------------------|------------------------------|
+| `image:` | ~20 | registry/project ของคุณ (Step 4) |
+| `nodeName:` | ~15 | node ที่ app pod เจ้าของ data อยู่ (จำเป็นถ้า source เป็น RWO) |
+| `volumes[src] claimName` | ~159 | ชื่อ PVC **แหล่งข้อมูล** — เช่น `data-filewriter-0`, `mysql-data-iscsi` |
+| `volumes[dst] claimName` | ~162 | ชื่อ PVC **ปลายทาง** — เช่น `data-filewriter-nfs-0`, `mysql-data-nfs` |
+| `volumes[log] claimName` | ~165 | ชื่อ PVC บันทึก log (อยู่ SC ปลายทาง) |
+| `volumeMounts[src] readOnly` | (ใน pod) | `true` แนะนำ — ป้องกันเขียนผิดที่แหล่งข้อมูล |
+| `args` → `--timeout=` | ~55 | timeout rsync ต่อ file (default 10; เพิ่มเป็น 30-60 ถ้า data ใหญ่) |
+| `args` → `sleep 300` | ~142 | รอบระหว่าง sync (default 300s) |
+| `resources` | | ปรับ CPU/mem ถ้า volume ใหญ่ |
+
+ตัวอย่างการแมปจริง (3 replicas = 3 files ชุดเดียวกัน ไม่ใช่ STS auto):
+คุณต้องสร้าง 3 manifest ชุด (หรืออ่านจาก repo demo) โดยไฟล์แต่ละใบชี้
+`rsync-helper-0 → claimName data-<app>-0 / data-<app>-nfs-0` และอื่นตาม ordinal
+
+### MODE 2 — `04-rsync-helper-statefulset.yaml`
+
+| Field | Where | What to change / ต้องแก้เป็น |
+|-------|-------|------------------------------|
+| `image:` | ~33 | registry/project ของคุณ |
+| `replicas:` | (spec) | จำนวน replica ตรงกับ app |
+| `serviceName:` | (spec) | ต้องมี headless Service `rsync-helper` (สร้างก่อน) |
+| `volumeClaimTemplates[src]` | ~183-190 | `storageClassName` = SC แหล่งข้อมูล; หมายเหตุ RWO co-location |
+| `volumeClaimTemplates[dst]` | ~191-197 | `storageClassName` = SC ปลายทาง |
+| `volumeClaimTemplates[log]` | ~198-206 | `storageClassName` = SC ปลายทาง |
+| `nodeAffinity` (commented) | ~168 | unlock ถ้าต้อง pin node (ดู sts-gotchas.md ข้อ 3) |
+
+และถ้าใช้ **pre-created PVCs** (`02-src-pvc-0.yaml`, `03-dst-pvc-0.yaml`,
+`05-log-pvc.yaml`) — ชื่อ/SC/accessMode ต้องตรง pattern `<template>-<sts>-<ordinal>`
+เป๊ะถึงจะ adopt ได้ (ดู `manifests/mode-statefulset/01-README.md`)
+
+### Checklist ก่อน apply / ตรวจก่อนคืน
+
+```bash
+grep -n '<PLACEHOLDER>\|<REGISTRY_' rsync_helper/manifests/ -r    # ต้องไม่เหลือ
+kubectl apply --dry-run=client -f manifests/mode-single-pod/       # ทดสอบ syntax
+```
 
 ---
 
