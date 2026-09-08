@@ -1,0 +1,13 @@
+# Pre-created PVC: log-rsync-helper-0 (NFS ตัวอย่าง)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: log-rsync-helper-0
+  namespace: demo
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: <dest-storage-class>
+  resources:
+    requests:
+      storage: 1Gi

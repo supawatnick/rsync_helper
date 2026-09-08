@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-dest-0
+  namespace: demo
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: <dest-storage-class>
+  resources:
+    requests:
+      storage: 5Gi

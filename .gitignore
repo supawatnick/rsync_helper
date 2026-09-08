@@ -1,0 +1,8 @@
+# logs / temp
+*.log
+*.tmp
+.DS_Store
+
+# kubeconfig / tokens (อย่าเผลอ commit)
+kubeconfig*
+*token*

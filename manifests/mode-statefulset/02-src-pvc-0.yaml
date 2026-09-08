@@ -1,0 +1,15 @@
+# Pre-created PVC: src-rsync-helper-0
+# - ชื่อต้องตรง pattern จาก volumeClaimTemplates: <template-name>-<sts-name>-<ordinal>
+# - ปรับ storageClassName / storage ตามจริง ก่อน apply
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: src-rsync-helper-0
+  namespace: demo
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: <source-storage-class>
+  resources:
+    requests:
+      storage: 5Gi
