@@ -170,21 +170,37 @@ Edit `04-rsync-helper.yaml`:
 - `nodeName` → the node where your app pod runs (needed when the source is RWO)
 - `interval` (default 300s) / `--timeout` (default 10)
 
-### MODE 2 — StatefulSet (scalable, STS-aware)
+### MODE 2 — StatefulSet source (rsync for data coming from a StatefulSet)
 
-Located in `manifests/mode-statefulset/`
+Use this when your **source data lives inside a StatefulSet** (each replica owns
+its own PVC, e.g. `data-filewriter-0/1/2`). We do **not** deploy rsync-helper as
+a StatefulSet of its own — instead we create **one standalone Pod per replica**
+(named `rsync-helper-N`) that pairs with `app-N` and mounts **its** PVCs directly.
+
+Located in `manifests/mode-sts-source/` (example assumes the source STS
+`filewriter` has **3 replicas**):
 
 ```bash
-kubectl apply -f manifests/mode-statefulset/00-namespace.yaml
-# create headless service first (see docs):
-kubectl apply -f manifests/mode-statefulset/04-rsync-helper-headless-service.yaml  # adjust
-kubectl apply -f manifests/mode-statefulset/04-rsync-helper-statefulset.yaml
+kubectl apply -f manifests/mode-sts-source/
 ```
 
-This deploys the same loop as a `StatefulSet` with `podManagementPolicy: Parallel`.
-Read **`docs/sts-gotchas.md`** before using it — there are 7 important pitfalls
-(PVC immutable naming, `restartPolicy: Always`, RWO co-location, required headless
-Service, scale-down vs PVC deletion, updateStrategy, adoption rules).
+Pairing pattern (see `manifests/mode-sts-source/01-README.md` for the full
+table):
+
+| app pod (STS)   | node          | rsync-helper pod    | src PVC             | dst PVC                 | log PVC             |
+|-----------------|---------------|---------------------|---------------------|-------------------------|---------------------|
+| `filewriter-0`  | `k8s-clus1-w1` | `rsync-helper-0`    | `data-filewriter-0` | `data-filewriter-nfs-0` | `rsync-helper-log-0` |
+| `filewriter-1`  | `k8s-clus1-w2` | `rsync-helper-1`    | `data-filewriter-1` | `data-filewriter-nfs-1` | `rsync-helper-log-1` |
+| `filewriter-2`  | `k8s-clus1-w1` | `rsync-helper-2`    | `data-filewriter-2` | `data-filewriter-nfs-2` | `rsync-helper-log-2` |
+
+Each pod pins `nodeName` to the same node as its app pod (required because the
+source is ReadWriteOnce). If your STS has a different replica count, copy
+`04-rsync-helper-pod-0.yaml` per ordinal and adjust `metadata.name`, `nodeName`
+and the three `claimName`s.
+
+Read **`docs/sts-gotchas.md`** before using it — it explains why pods-per-replica
+is preferred over a helper StatefulSet, and the pitfalls around StatefulSet
+sources (PVC immutable naming, RWO co-location, scale-up/down, update strategy).
 
 ---
 
@@ -198,7 +214,7 @@ environment. Below is the **line-by-line checklist** for each file.
 | File | Field | What to change / ต้องแก้เป็น |
 |------|-------|------------------------------|
 | `manifests/mode-single-pod/00-namespace.yaml` | `metadata.name` | namespace ของคุณ (default `demo`) |
-| `manifests/mode-statefulset/00-namespace.yaml` | `metadata.name` | namespace ของคุณ |
+| `manifests/mode-sts-source/00-namespace.yaml` | `metadata.name` | namespace ของคุณ |
 | both `04-rsync-helper*.yaml` | `metadata.namespace` | ชื่อ namespace ตรงกับข้างบน |
 | all PVC files | `metadata.namespace` | ชื่อ namespace เดียวกัน |
 | all PVC files | `spec.storageClassName` | ชื่อ StorageClass ของ storage ปลายทาง/ต้นทางตามจริง |
@@ -219,25 +235,24 @@ environment. Below is the **line-by-line checklist** for each file.
 | `args` → `sleep 300` | ~142 | รอบระหว่าง sync (default 300s) |
 | `resources` | | ปรับ CPU/mem ถ้า volume ใหญ่ |
 
-ตัวอย่างการแมปจริง (3 replicas = 3 files ชุดเดียวกัน ไม่ใช่ STS auto):
-คุณต้องสร้าง 3 manifest ชุด (หรืออ่านจาก repo demo) โดยไฟล์แต่ละใบชี้
-`rsync-helper-0 → claimName data-<app>-0 / data-<app>-nfs-0` และอื่นตาม ordinal
+ตัวอย่างการแมปจริง (3 replicas = 3 manifest แยก — MODE 2 ใช้ pattern นี้เหมือนกัน):
+สร้าง 1 manifest ต่อ ordinal โดยชี้ `rsync-helper-N → claimName data-<app>-N /
+data-<app>-nfs-N` และ `nodeName` = node ของ `app-N`
 
-### MODE 2 — `04-rsync-helper-statefulset.yaml`
+### MODE 2 — `04-rsync-helper-pod-0.yaml` (+ pod-1, pod-2) — source จาก StatefulSet
 
 | Field | Where | What to change / ต้องแก้เป็น |
 |-------|-------|------------------------------|
-| `image:` | ~33 | registry/project ของคุณ |
-| `replicas:` | (spec) | จำนวน replica ตรงกับ app |
-| `serviceName:` | (spec) | ต้องมี headless Service `rsync-helper` (สร้างก่อน) |
-| `volumeClaimTemplates[src]` | ~183-190 | `storageClassName` = SC แหล่งข้อมูล; หมายเหตุ RWO co-location |
-| `volumeClaimTemplates[dst]` | ~191-197 | `storageClassName` = SC ปลายทาง |
-| `volumeClaimTemplates[log]` | ~198-206 | `storageClassName` = SC ปลายทาง |
-| `nodeAffinity` (commented) | ~168 | unlock ถ้าต้อง pin node (ดู sts-gotchas.md ข้อ 3) |
+| `image:` | ~28 | registry/project ของคุณ |
+| `metadata.name` | ~8 | `rsync-helper-N` (จับคู่ ordinal app) |
+| `nodeName:` | ~15 | node ที่ `app-N` อยู่ (ดูจาก `kubectl get pods -o wide`) |
+| `volumes[src] claimName` | ~158 | PVC ของ app ordinal N (เช่น `data-filewriter-0/1/2`) |
+| `volumes[dst] claimName` | ~161 | PVC ปลายทาง ordinal N (เช่น `data-filewriter-nfs-0/1/2`) |
+| `volumes[log] claimName` | ~164 | PVC log ordinal N (`rsync-helper-log-N`) |
+| `LOG_FILE` | args | ชื่อ log ต่อ ordinal (เช่น `sync-history-pod-2.log`) |
 
-และถ้าใช้ **pre-created PVCs** (`02-src-pvc-0.yaml`, `03-dst-pvc-0.yaml`,
-`05-log-pvc.yaml`) — ชื่อ/SC/accessMode ต้องตรง pattern `<template>-<sts>-<ordinal>`
-เป๊ะถึงจะ adopt ได้ (ดู `manifests/mode-statefulset/01-README.md`)
+> สร้าง PVC ปลายทาง (`data-<app>-nfs-N`) ให้ครบก่อน apply — ไฟล์นี้ไม่มี
+> volumeClaimTemplates (เป็น Pod ตัว ๆ อ้าง claimName ตรง ๆ)
 
 ### Checklist ก่อน apply / ตรวจก่อนคืน
 
@@ -324,13 +339,12 @@ rsync_helper/
 │   │   ├── 02-dst-pvc.yaml
 │   │   ├── 03-log-pvc.yaml
 │   │   └── 04-rsync-helper.yaml
-│   └── mode-statefulset/             # MODE 2 — StateSet-aware
+│   └── mode-sts-source/              # MODE 2 — rsync สำหรับ source ที่มาจาก StatefulSet
 │       ├── 00-namespace.yaml
-│       ├── 01-README.md              # adoption & naming rules
-│       ├── 02-src-pvc-0.yaml
-│       ├── 03-dst-pvc-0.yaml
-│       ├── 04-rsync-helper-statefulset.yaml
-│       └── 05-log-pvc.yaml
+│       ├── 01-README.md              # pairing map (ตัวอย่าง 3 replicas) + วิธีปรับ N replicas
+│       ├── 04-rsync-helper-pod-0.yaml
+│       ├── 04-rsync-helper-pod-1.yaml
+│       └── 04-rsync-helper-pod-2.yaml
 └── docs/
     └── sts-gotchas.md                # ⚠️ must-read for StatefulSet users
 ```

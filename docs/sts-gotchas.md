@@ -1,114 +1,101 @@
-# rsync-helper with StatefulSet — Gotchas (Things to be careful about)
+# rsync-helper with a StatefulSet source — Gotchas (Things to be careful about)
 
-When using rsync-helper to migrate/replicate data for an application that runs
-inside a **StatefulSet**, you must know the following. These pitfalls are the
-reason the `mode-single-pod` (standalone Pod) approach is often simpler.
+When you migrate/replicate data for an application that runs inside a
+**StatefulSet**, this document explains why **rsync-helper itself is deployed
+as standalone Pods (`manifests/mode-sts-source/`)** — one per replica — instead
+of wrapping the helper in its own StatefulSet — and what to watch out for.
+
+**Core decision:** MODE 2 does **not** create a helper StatefulSet. Each
+`rsync-helper-N` Pod is a normal Pod (`restartPolicy: Never`) that mounts the
+*application's* existing PVCs by name and pins `nodeName` to the same node as
+`app-N`. The helper StatefulSet approach was rejected for the reasons below.
 
 ---
 
-## 1. PVC names are immutable and auto-generated
+## 1. Making rsync-helper a StatefulSet of its own fights K8s rules
 
-StatefulSet creates PVCs using:
+StatefulSet auto-generates PVC names with:
 
 ```
 <volumeClaimTemplate.name>-<statefulset.name>-<ordinal>
 ```
 
-Example: `volumeClaimTemplates.src` + `statefulset rsync-helper` → PVC `src-rsync-helper-0`.
-
-- You **cannot rename** a PVC after it is created (`metadata.name` is immutable).
-- If you need a custom name, pre-create the PVC with the exact generated name and
-  the StatefulSet will *adopt* it on `apply`. Fields must match exactly
-  (`storageClassName`, `accessModes`, capacity) otherwise adoption fails.
-
----
-
-## 2. StatefulSet forces restartPolicy: Always — your loop must never exit
-
-Standalone Pods (MODE 1) use `restartPolicy: Never`. **StatefulSet pods do not
-accept `Never`**; they always use `Always`. If your script exits (even because
-rsync failed), the container restarts, which can cause duplicate/overlapping
-syncs or churn.
-
-Design rules for the script inside a StatefulSet:
-
-- Wrap everything in an infinite `while true` loop (the repo manifests already do this).
-- **Never `exit 1` on rsync failure** — log the error and continue to the next iteration.
-- Use `sleep <interval>` as the pacemaker so one run is bounded.
+If the helper were a StatefulSet, its `src` could never point at the app's
+already-existing PVCs (`data-filewriter-0`) because `claimName` is a **static
+value** — you cannot put a variable into it. You would be forced into awkward
+workarounds (static PV rebinding, adoption tricks). That is why we simply
+mount the app's PVCs directly from a standalone Pod instead.
 
 ---
 
-## 3. ReadWriteOnce (RWO) co-location problem
+## 2. StatefulSet forces restartPolicy: Always — standalone Pods use Never
 
-If the source PVC is `ReadWriteOnce` (RWO), it can only attach to **one node**.
-The rsync-helper pod for table `N` must therefore run on the *same node* as the
-application pod `N`.
+- **Standalone Pods** (MODE 1 & MODE 2) can use `restartPolicy: Never`: the pod
+  runs its sync loop, and if you want to stop syncing you delete the pod.
+- **StatefulSet pods accept only `Always`**. Any script `exit` (even from an
+  rsync failure) triggers an immediate restart → duplicate/overlapping syncs.
 
-| Approach           | How | Pros / Cons |
-|--------------------|-----|-------------|
-| `nodeName` in pod | Set the node explicitly | Simple, but hardcoded — used in MODE 1 |
-| `nodeAffinity`     | Pin by `kubernetes.io/hostname` | Works in a single StatefulSet template, but all replicas share it → cannot differ per ordinal |
-| Node/pod anti-affinity on the app's hostname | Let scheduler choose | Complex; still relies on knowing app placement |
-
-> **Practical tip:** If you need per-ordinal node matching, a standalone Pod
-> per replica (MODE 1) with an explicit `nodeName` is far simpler to reason
-> about than a StatefulSet.
+Rule for the script (works in both Pod modes): wrap everything in an infinite
+`while true` loop, **never `exit` on rsync error**, and use `sleep <interval>`
+as the pacemaker.
 
 ---
 
-## 4. A StatefulSet always needs a headless Service
+## 3. ReadWriteOnce (RWO) co-location — why each helper pins its node
 
-A StatefulSet requires `spec.serviceName` to point to a headless Service, even
-if rsync-helper does not need DNS for anything else. Without it the StatefulSet
-will not create pods.
+A source PVC that is `ReadWriteOnce` can attach to **one node only**. Therefore
+`rsync-helper-N` must run on the *same node* as `app-N` (e.g. `filewriter-0` is
+on `k8s-clus1-w1` → `rsync-helper-0` must also be on `k8s-clus1-w1`).
 
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: rsync-helper
-spec:
-  clusterIP: None          # headless
-  selector:
-    app: rsync-helper
-```
+| Approach | How | Verdict |
+|----------|-----|---------|
+| `nodeName` in each pod | Hardcode the node per file | ✅ Recommended — one pod per replica, each with its own `nodeName` (matches MODE 2) |
+| `nodeAffinity` (`kubernetes.io/hostname`) | Pin by node label | Fine, but as a single pod per replica it is no better than `nodeName` |
+| A helper StatefulSet + nodeAffinity | All replicas share one template | ❌ Cannot differ per ordinal — every pod would pin the same node |
 
-(The 04-rsync-helper-statefulset.yaml relies on an existing `rsync-helper`
-headless Service — create it first.)
+> The easy way to know the node: `kubectl get pods -n <ns> -o wide` and copy the
+> NODE column of `app-N` into `spec.nodeName` of `rsync-helper-N`.
 
 ---
 
-## 5. Scaling down does NOT delete PVCs
+## 4. A helper StatefulSet needs a headless Service — standalone Pods don't
 
-- Scaling a StatefulSet down to fewer replicas leaves the PVCs behind (data is
-  preserved — good for rollback).
-- But the rsync-helper running for that ordinal disappears, so that replica's
-  sync stops.
-- Re-scaling up with `podManagementPolicy: Parallel` re-attaches the old PVC
-  (same name) and resumes.
+StatefulSets require `spec.serviceName` → headless Service, even when the pod
+does no networking. Standalone Pods have no such requirement — one fewer thing
+to create and debug. (Not applicable to MODE 1 / MODE 2.)
 
 ---
 
-## 6. updateStrategy — be careful during migration
+## 5. Scaling the *source* StatefulSet changes the pair set
 
-- Default `RollingUpdate` in StatefulSet **recreates pods one-by-one**, so
-  rsync-helper pods get restarted mid-loop (each restarts its loop from iteration 1).
-- If you apply a real update while a migration is running, use
-  `updateStrategy: { type: OnDelete }` to control exactly when pods are replaced,
-  or freeze the app (scale to 0) during the final sync.
+- Scaling the app STS **down** leaves its PVCs behind (data survives — good for
+  rollback), but the data keeps changing only while `app-N` runs.
+- If you can't stop the app during final sync, the ordinals that no longer exist
+  simply don't need a helper.
+- Scaling the app STS **up** → create additional `rsync-helper-N` files for the
+  new ordinals (copy `04-rsync-helper-pod-0.yaml`, adjust `nodeName` + claims).
 
 ---
 
-## 7. Adoption & data-ownership rules
+## 6. updateStrategy of the source app — control the churn
 
-- A PVC pre-created for adoption must match the template's `storageClassName`,
-  `accessModes` and requested capacity **exactly**.
-- If rsync-helper's `src` must point at a PVC owned by *another* StatefulSet
-  (e.g. `data-filewriter-0`), you cannot reference an ordinal variable inside
-  `claimName`. You must either:
-  - create a static PVC/PV pair that is bound to the app's underlying volume, or
-  - mount the app's PVC into the *same* pod (sidecar pattern), not into a
-    separate rsync-helper StatefulSet.
+- Default `RollingUpdate` recreates app pods **one-by-one**. A recreated pod
+  lands on the same node (its RWO PVC forces it), so the helper keeps working —
+  but the app may briefly release/reattach the volume while rsync is running.
+- For a clean final cutover: set `updateStrategy: { type: OnDelete }` or scale
+  the app to 0, run a final rsync, verify MD5, then switch the app config to the
+  destination storage.
+
+---
+
+## 7. Data ownership & rollback
+
+- The helper only ever **reads** the source (`volumeMounts src → readOnly: true`)
+  and **writes** to destination + its own log PVC.
+- Keep the source PVCs during migration (do not delete them). Delete them only
+  after you have verified the destination and run the app there for a while.
+- Log PVC (`rsync-helper-log-N`) is unique per replica — use it to audit that
+  every ordinal converged (`[ALL N FILES OK - data integrity verified]`).
 
 ---
 
@@ -117,6 +104,6 @@ headless Service — create it first.)
 | Scenario | Recommended mode |
 |----------|------------------|
 | Single replica, simple data copy | MODE 1 (single Pod) |
-| Multiple replicas, source is RWO on fixed nodes | MODE 1 per replica with `nodeName` |
-| Data in one StatefulSet, no RWO co-location pain | MODE 2 (StatefulSet) |
-| Need sidecar-like mount of the app's own PVC | Sidecar container inside the app STS |
+| Source is a StatefulSet (N replicas), RWO volumes | MODE 2 — one standalone Pod per ordinal + `nodeName` |
+| Need the helper inside the app pod's own netns | Sidecar container inside the app STS |
+| Helper as its own StatefulSet | ❌ Avoid (PVC naming + restartPolicy fights) |
